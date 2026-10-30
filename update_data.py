@@ -36,7 +36,22 @@ def main():
     except Exception as exc:
         print(f'HK history unavailable: {exc}')
         hk = old.get('hk3195', [])
-    payload = {'updatedAt': datetime.now(timezone.utc).isoformat(), 'source': 'Eastmoney public endpoints', 'funds': funds, 'hk3195': hk}
+    quotes = old.get('quotes', {})
+    for url in [
+        'https://push2.eastmoney.com/api/qt/clist/get?pn=1&pz=10&fid=f3&fs=i:100.SPX,i:100.NDX&fields=f2,f3,f12,f14,f124&fltt=2',
+        'https://push2.eastmoney.com/api/qt/ulist.np/get?fltt=2&secids=116.03195&fields=f2,f3,f12,f14,f124',
+    ]:
+        try:
+            data = get(url).get('data') or {}
+            diff = data.get('diff') or []
+            rows = diff.values() if isinstance(diff, dict) else diff
+            for row in rows:
+                key = {'SPX':'spx','NDX':'ndx','03195':'hk3195'}.get(row.get('f12'))
+                if key and isinstance(row.get('f2'), (int,float)) and isinstance(row.get('f3'), (int,float)):
+                    quotes[key] = {'price':float(row['f2']),'changePct':float(row['f3']),'timestamp':row.get('f124'),'source':'东方财富快照'}
+        except Exception as exc:
+            print(f'Quote unavailable: {exc}')
+    payload = {'updatedAt': datetime.now(timezone.utc).isoformat(), 'source': 'Eastmoney public endpoints', 'funds': funds, 'hk3195': hk, 'quotes': quotes}
     target.write_text(json.dumps(payload, ensure_ascii=False, separators=(',', ':')) + '\n')
     print(f'Wrote {target}: {len(funds)} funds, {len(hk)} HK prices')
 
