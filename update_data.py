@@ -86,7 +86,6 @@ def main():
     quotes = old.get('quotes', {})
     for url in [
         'https://push2.eastmoney.com/api/qt/clist/get?pn=1&pz=10&fid=f3&fs=i:100.SPX&fields=f2,f3,f12,f14,f124&fltt=2',
-        'https://push2.eastmoney.com/api/qt/ulist.np/get?fltt=2&secids=116.03195&fields=f2,f3,f12,f14,f124',
     ]:
         try:
             data = get(url).get('data') or {}
@@ -99,11 +98,15 @@ def main():
         except Exception as exc:
             print(f'Quote unavailable: {exc}')
     try:
-        ndx = get('https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param=usNDX,day,,,2,qfq')['data']['usNDX']
-        q = ndx['qt']['usNDX']
-        quotes['ndx'] = {'price': float(q[3]), 'changePct': float(q[32]), 'date': ndx['day'][-1][0], 'source': '腾讯财经'}
+        for symbol,key in [('usNDX','ndx'),('hk03195','hk3195')]:
+            row = get(f'https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param={symbol},day,,,2,qfq')['data'][symbol]
+            q = row['qt'][symbol]
+            quotes[key] = {'price': float(q[3]), 'changePct': float(q[32]), 'date': row['day'][-1][0], 'source': '腾讯财经'}
     except Exception as exc:
-        print(f'Nasdaq 100 quote unavailable: {exc}')
+        print(f'Tencent quote unavailable: {exc}')
+    if 'spx' not in quotes and len(benchmarks.get('spx', [])) >= 2:
+        last, prev = benchmarks['spx'][-1], benchmarks['spx'][-2]
+        quotes['spx'] = {'price': last['close'], 'changePct': 100*(last['close']/prev['close']-1), 'date': last['date'], 'source': 'FRED收盘'}
     payload = {'updatedAt': datetime.now(timezone.utc).isoformat(), 'source': 'Eastmoney, Tencent Finance, FRED, ECB public data', 'funds': funds, 'hk3195': hk, 'quotes': quotes, 'benchmarks': benchmarks, 'fx': fx}
     target.write_text(json.dumps(payload, ensure_ascii=False, separators=(',', ':')) + '\n')
     print(f'Wrote {target}: {len(funds)} funds, {len(hk)} HK prices')
