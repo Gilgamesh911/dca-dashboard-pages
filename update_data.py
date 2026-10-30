@@ -87,7 +87,7 @@ def main():
         print(f'HK history unavailable: {exc}')
         hk = old.get('hk3195', [])
     benchmarks = old.get('benchmarks', {})
-    for name, provider in [('spx', lambda: fred_history('SP500')), ('ndx', lambda: fred_history('NASDAQ100')), ('hsi', lambda: tencent_history('hkHSI')), ('csi300', lambda: tencent_history('sh000300')), ('nikkei', lambda: fred_history('NIKKEI225'))]:
+    for name, provider in [('spx', lambda: merge(fred_history('SP500'), tencent_history('us.INX'))), ('ndx', lambda: fred_history('NASDAQ100')), ('hsi', lambda: tencent_history('hkHSI')), ('csi300', lambda: tencent_history('sh000300')), ('nikkei', lambda: fred_history('NIKKEI225'))]:
         try:
             rows = provider()
             if rows:
@@ -115,7 +115,7 @@ def main():
         except Exception as exc:
             print(f'Quote unavailable: {exc}')
     try:
-        for symbol,key in [('usNDX','ndx'),('hk03195','hk3195')]:
+        for symbol,key in [('us.INX','spx'),('usNDX','ndx'),('hk03195','hk3195')]:
             row = get(f'https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param={symbol},day,,,2,qfq')['data'][symbol]
             q = row['qt'][symbol]
             quotes[key] = {'price': float(q[3]), 'changePct': float(q[32]), 'date': row['day'][-1][0], 'source': '腾讯财经'}
