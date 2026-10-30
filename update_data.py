@@ -3,7 +3,7 @@ import json
 import csv
 import io
 import subprocess
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from xml.etree import ElementTree
 
@@ -21,22 +21,23 @@ def merge(old_rows, new_rows):
     rows.update({item['date']: item for item in new_rows})
     return sorted(rows.values(), key=lambda item: item['date'])
 
-def tencent_history(symbol):
-    url = f'https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param={symbol},day,,,100,qfq'
+def tencent_history(symbol, start='2026-10-20', count=100):
+    url = f'https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param={symbol},day,,,{count},qfq'
     rows = (get(url).get('data') or {}).get(symbol, {}).get('day', [])
-    return [{'date': p[0], 'close': float(p[2])} for p in rows if p[0] >= '2026-10-20']
+    return [{'date': p[0], 'close': float(p[2])} for p in rows if p[0] >= start]
 
 def fred_history(series):
     raw = get_text(f'https://fred.stlouisfed.org/graph/fredgraph.csv?id={series}&cosd=2026-10-20')
     return [{'date': row['observation_date'], 'close': float(row[series])} for row in csv.DictReader(io.StringIO(raw)) if row.get(series) not in ('', '.') and row['observation_date'] >= '2026-10-20']
 
-def ecb_fx():
-    raw = get_text('https://www.ecb.europa.eu/stats/eurofxref/eurofxref-hist-90d.xml')
+def ecb_fx(start, full=False):
+    file = 'eurofxref-hist.xml' if full else 'eurofxref-hist-90d.xml'
+    raw = get_text(f'https://www.ecb.europa.eu/stats/eurofxref/{file}')
     root = ElementTree.fromstring(raw)
     result = []
     for cube in root.iter():
         date = cube.attrib.get('time')
-        if not date or date < '2026-10-20':
+        if not date or date < start:
             continue
         rates = {child.attrib.get('currency'): float(child.attrib['rate']) for child in cube if child.attrib.get('currency') in ('CNY', 'USD', 'HKD', 'JPY')}
         if len(rates) == 4:
@@ -47,15 +48,27 @@ def main():
     target = ROOT / 'data' / 'market.json'
     old = json.loads(target.read_text()) if target.exists() else {}
     funds = {}
+    backtest_funds = {}
+    cutoff = (datetime.now(timezone.utc).date() - timedelta(days=370)).isoformat()
     for code in FUNDS:
-        url = f'https://api.fund.eastmoney.com/f10/lsjz?fundCode={code}&pageIndex=1&pageSize=20'
-        data = get(url)
-        if data.get('ErrCode') != 0 or not (data.get('Data') or {}).get('LSJZList'):
-            raise RuntimeError(f'NAV unavailable: {code}')
+        previous = old.get('backtestFunds', {}).get(code, [])
+        previous_latest = previous[-1]['date'] if previous else None
         entries = []
-        for row in data['Data']['LSJZList']:
-            date, value = row.get('FSRQ'), row.get('DWJZ')
-            if date and value and date >= '2026-10-27':
+        for page in range(1, 31):
+            url = f'https://api.fund.eastmoney.com/f10/lsjz?fundCode={code}&pageIndex={page}&pageSize=20'
+            try:
+                data = get(url)
+                rows = (data.get('Data') or {}).get('LSJZList') or []
+                if data.get('ErrCode') != 0 or not rows:
+                    raise RuntimeError(f'NAV unavailable: {code}, page {page}')
+            except Exception:
+                if previous:
+                    break
+                raise
+            for row in rows:
+                date, value = row.get('FSRQ'), row.get('DWJZ')
+                if not date or not value or date < cutoff:
+                    continue
                 entry = {'date': date, 'nav': float(value), 'changePct': float(row['JZZZL']) if row.get('JZZZL') else None}
                 try:
                     dividend = float(row.get('FHFCZ') or 0)
@@ -64,9 +77,12 @@ def main():
                 except ValueError:
                     pass
                 entries.append(entry)
-        funds[code] = merge(old.get('funds', {}).get(code, []), entries)
+            if rows[-1]['FSRQ'] <= (previous_latest or cutoff):
+                break
+        backtest_funds[code] = [row for row in merge(previous, entries) if row['date'] >= cutoff]
+        funds[code] = merge(old.get('funds', {}).get(code, []), [row for row in entries if row['date'] >= '2026-10-27'])
     try:
-        hk = merge(old.get('hk3195', []), [row for row in tencent_history('hk03195') if row['date'] >= '2026-11-01'])
+        hk = merge(old.get('hk3195', []), tencent_history('hk03195', start=cutoff, count=500))
     except Exception as exc:
         print(f'HK history unavailable: {exc}')
         hk = old.get('hk3195', [])
@@ -79,7 +95,8 @@ def main():
         except Exception as exc:
             print(f'Benchmark {name} unavailable: {exc}')
     try:
-        fx = merge(old.get('fx', []), ecb_fx())
+        old_fx = old.get('fx', [])
+        fx = merge(old_fx, ecb_fx(cutoff, full=not old_fx or old_fx[0]['date'] > cutoff))
     except Exception as exc:
         print(f'FX unavailable: {exc}')
         fx = old.get('fx', [])
@@ -107,7 +124,7 @@ def main():
     if 'spx' not in quotes and len(benchmarks.get('spx', [])) >= 2:
         last, prev = benchmarks['spx'][-1], benchmarks['spx'][-2]
         quotes['spx'] = {'price': last['close'], 'changePct': 100*(last['close']/prev['close']-1), 'date': last['date'], 'source': 'FRED收盘'}
-    payload = {'updatedAt': datetime.now(timezone.utc).isoformat(), 'source': 'Eastmoney, Tencent Finance, FRED, ECB public data', 'funds': funds, 'hk3195': hk, 'quotes': quotes, 'benchmarks': benchmarks, 'fx': fx}
+    payload = {'updatedAt': datetime.now(timezone.utc).isoformat(), 'source': 'Eastmoney, Tencent Finance, FRED, ECB public data', 'funds': funds, 'backtestFunds': backtest_funds, 'hk3195': hk, 'quotes': quotes, 'benchmarks': benchmarks, 'fx': fx}
     target.write_text(json.dumps(payload, ensure_ascii=False, separators=(',', ':')) + '\n')
     print(f'Wrote {target}: {len(funds)} funds, {len(hk)} HK prices')
 
