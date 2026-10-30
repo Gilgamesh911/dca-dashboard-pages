@@ -1,15 +1,47 @@
 """Build a public, credential-free market snapshot for GitHub Pages."""
 import json
+import csv
+import io
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
+from xml.etree import ElementTree
 
 ROOT = Path(__file__).resolve().parent
 FUNDS = ('017641', '019305', '019172', '019173')
 
 def get(url):
-    raw = subprocess.check_output(['curl', '--fail', '--silent', '--show-error', '--retry', '2', '--max-time', '20', '-H', 'Referer: https://fundf10.eastmoney.com/', url], timeout=70)
-    return json.loads(raw)
+    return json.loads(get_text(url))
+
+def get_text(url):
+    return subprocess.check_output(['curl', '--fail', '--silent', '--show-error', '--retry', '2', '--max-time', '20', '-H', 'Referer: https://fundf10.eastmoney.com/', url], timeout=70).decode('utf-8')
+
+def merge(old_rows, new_rows):
+    rows = {item['date']: item for item in old_rows}
+    rows.update({item['date']: item for item in new_rows})
+    return sorted(rows.values(), key=lambda item: item['date'])
+
+def tencent_history(symbol):
+    url = f'https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param={symbol},day,,,100,qfq'
+    rows = (get(url).get('data') or {}).get(symbol, {}).get('day', [])
+    return [{'date': p[0], 'close': float(p[2])} for p in rows if p[0] >= '2026-10-20']
+
+def fred_history(series):
+    raw = get_text(f'https://fred.stlouisfed.org/graph/fredgraph.csv?id={series}&cosd=2026-10-20')
+    return [{'date': row['observation_date'], 'close': float(row[series])} for row in csv.DictReader(io.StringIO(raw)) if row.get(series) not in ('', '.') and row['observation_date'] >= '2026-10-20']
+
+def ecb_fx():
+    raw = get_text('https://www.ecb.europa.eu/stats/eurofxref/eurofxref-hist-90d.xml')
+    root = ElementTree.fromstring(raw)
+    result = []
+    for cube in root.iter():
+        date = cube.attrib.get('time')
+        if not date or date < '2026-10-20':
+            continue
+        rates = {child.attrib.get('currency'): float(child.attrib['rate']) for child in cube if child.attrib.get('currency') in ('CNY', 'USD', 'HKD', 'JPY')}
+        if len(rates) == 4:
+            result.append({'date': date, 'CNY': 1, 'USD': rates['CNY']/rates['USD'], 'HKD': rates['CNY']/rates['HKD'], 'JPY': rates['CNY']/rates['JPY']})
+    return sorted(result, key=lambda item: item['date'])
 
 def main():
     target = ROOT / 'data' / 'market.json'
@@ -24,18 +56,33 @@ def main():
         for row in data['Data']['LSJZList']:
             date, value = row.get('FSRQ'), row.get('DWJZ')
             if date and value and date >= '2026-10-27':
-                entries.append({'date': date, 'nav': float(value), 'changePct': float(row['JZZZL']) if row.get('JZZZL') else None})
-        merged = {item['date']: item for item in old.get('funds', {}).get(code, [])}
-        merged.update({item['date']: item for item in entries})
-        funds[code] = sorted(merged.values(), key=lambda item: item['date'])
-    url = 'https://push2his.eastmoney.com/api/qt/stock/kline/get?secid=116.03195&fields1=f1,f2,f3,f4,f5,f6&fields2=f51,f52,f53,f54,f55,f56&klt=101&fqt=0&beg=20261001&end=20500101&lmt=1000'
+                entry = {'date': date, 'nav': float(value), 'changePct': float(row['JZZZL']) if row.get('JZZZL') else None}
+                try:
+                    dividend = float(row.get('FHFCZ') or 0)
+                    if 0 < dividend < float(value):
+                        entry['dividend'] = dividend
+                except ValueError:
+                    pass
+                entries.append(entry)
+        funds[code] = merge(old.get('funds', {}).get(code, []), entries)
     try:
-        raw = get(url)
-        klines = (raw.get('data') or {}).get('klines', [])
-        hk = [{'date': p[0], 'close': float(p[2])} for line in klines if (p := line.split(',')) and len(p) >= 3 and p[0] >= '2026-11-01']
+        hk = merge(old.get('hk3195', []), [row for row in tencent_history('hk03195') if row['date'] >= '2026-11-01'])
     except Exception as exc:
         print(f'HK history unavailable: {exc}')
         hk = old.get('hk3195', [])
+    benchmarks = old.get('benchmarks', {})
+    for name, provider in [('spx', lambda: fred_history('SP500')), ('ndx', lambda: fred_history('NASDAQ100')), ('hsi', lambda: tencent_history('hkHSI')), ('csi300', lambda: tencent_history('sh000300')), ('nikkei', lambda: fred_history('NIKKEI225'))]:
+        try:
+            rows = provider()
+            if rows:
+                benchmarks[name] = merge(benchmarks.get(name, []), rows)
+        except Exception as exc:
+            print(f'Benchmark {name} unavailable: {exc}')
+    try:
+        fx = merge(old.get('fx', []), ecb_fx())
+    except Exception as exc:
+        print(f'FX unavailable: {exc}')
+        fx = old.get('fx', [])
     quotes = old.get('quotes', {})
     for url in [
         'https://push2.eastmoney.com/api/qt/clist/get?pn=1&pz=10&fid=f3&fs=i:100.SPX,i:100.NDX&fields=f2,f3,f12,f14,f124&fltt=2',
@@ -51,7 +98,7 @@ def main():
                     quotes[key] = {'price':float(row['f2']),'changePct':float(row['f3']),'timestamp':row.get('f124'),'source':'东方财富快照'}
         except Exception as exc:
             print(f'Quote unavailable: {exc}')
-    payload = {'updatedAt': datetime.now(timezone.utc).isoformat(), 'source': 'Eastmoney public endpoints', 'funds': funds, 'hk3195': hk, 'quotes': quotes}
+    payload = {'updatedAt': datetime.now(timezone.utc).isoformat(), 'source': 'Eastmoney, Tencent Finance, FRED, ECB public data', 'funds': funds, 'hk3195': hk, 'quotes': quotes, 'benchmarks': benchmarks, 'fx': fx}
     target.write_text(json.dumps(payload, ensure_ascii=False, separators=(',', ':')) + '\n')
     print(f'Wrote {target}: {len(funds)} funds, {len(hk)} HK prices')
 
